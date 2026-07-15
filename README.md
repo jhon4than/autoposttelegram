@@ -7,7 +7,8 @@ Painel privado para armazenar imagens e vídeos e publicá-los, uma única vez p
 - Volume persistente: `/data`
 - Porta: `3000`
 - Healthcheck: `/api/health`
-- Limite por arquivo: 50 MB (limite atual da Bot API)
+- Limite por arquivo: até 2 GB quando conectado ao servidor local da Bot API
+- O serviço `telegram-bot-api` compartilha o volume `/data`, permitindo envio por caminho local sem carregar o vídeo inteiro na RAM.
 
 ```bash
 cp .env.example .env

@@ -12,6 +12,9 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const MAX_FILE_MB = Math.max(1, Number(process.env.MAX_FILE_MB) || 2000);
+const TELEGRAM_API_BASE = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/$/, '');
+const LOCAL_BOT_API = !TELEGRAM_API_BASE.includes('api.telegram.org');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'autopost.sqlite'));
 db.pragma('journal_mode = WAL');
@@ -44,7 +47,7 @@ app.use('/assets', express.static(path.join(__dirname, 'public'), { maxAge: '1d'
 const upload = multer({ storage: multer.diskStorage({
   destination: UPLOAD_DIR,
   filename: (_req, file, cb) => cb(null, `${Date.now()}-${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`)
-}), limits: { fileSize: 50 * 1024 * 1024, files: 100 }, fileFilter: (_req, file, cb) => cb(null, file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/')) });
+}), limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 100 }, fileFilter: (_req, file, cb) => cb(null, file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/')) });
 
 const tokenHash = t => crypto.createHash('sha256').update(t).digest('hex');
 function auth(req, res, next) {
@@ -60,7 +63,7 @@ function publicStats() {
   return { ...totals, sent, pending };
 }
 
-app.get('/api/health', (_req,res)=>res.json({ok:true}));
+app.get('/api/health', (_req,res)=>res.json({ok:true,localBotApi:LOCAL_BOT_API,maxFileMb:MAX_FILE_MB}));
 app.get('/login', (req,res)=> req.cookies.apt_session ? res.redirect('/') : res.sendFile(path.join(__dirname,'public','login.html')));
 app.post('/api/login', (req,res)=>{
   const user=db.prepare('SELECT * FROM users WHERE email=?').get(String(req.body.email||'').toLowerCase());
@@ -88,7 +91,7 @@ app.delete('/api/media/:id',auth,(req,res)=>{const m=db.prepare('SELECT * FROM m
 app.post('/api/destinations',auth,async(req,res)=>{
   const {name,chatId,botToken}=req.body;
   if(!name||!chatId||!botToken)return res.status(400).json({error:'Preencha nome, grupo e token'});
-  try{const r=await fetch(`https://api.telegram.org/bot${botToken}/getMe`);const j=await r.json();if(!j.ok)throw new Error(j.description);}
+  try{const r=await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/getMe`);const j=await r.json();if(!j.ok)throw new Error(j.description);}
   catch(e){return res.status(400).json({error:`Token inválido: ${e.message}`});}
   const id=db.prepare('INSERT INTO destinations(name,chat_id,bot_token) VALUES(?,?,?)').run(name,chatId,botToken).lastInsertRowid;
   res.json({ok:true,id});
@@ -102,7 +105,7 @@ app.post('/api/schedule',auth,(req,res)=>{
   res.json({ok:true}); setTimeout(tick,50);
 });
 app.post('/api/schedule/stop',auth,(_req,res)=>{db.prepare('UPDATE schedules SET enabled=0,next_run_at=NULL WHERE id=1').run();res.json({ok:true});});
-app.post('/api/destinations/:id/test',auth,async(req,res)=>{const d=db.prepare('SELECT * FROM destinations WHERE id=?').get(req.params.id);if(!d)return res.sendStatus(404);const r=await fetch(`https://api.telegram.org/bot${d.bot_token}/sendMessage`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:d.chat_id,text:'✅ AutoPost Telegram conectado com sucesso!'})});const j=await r.json();res.status(j.ok?200:400).json(j.ok?{ok:true}:{error:j.description});});
+app.post('/api/destinations/:id/test',auth,async(req,res)=>{const d=db.prepare('SELECT * FROM destinations WHERE id=?').get(req.params.id);if(!d)return res.sendStatus(404);const r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/sendMessage`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:d.chat_id,text:'✅ AutoPost Telegram conectado com sucesso!'})});const j=await r.json();res.status(j.ok?200:400).json(j.ok?{ok:true}:{error:j.description});});
 
 let ticking=false;
 async function tick(){
@@ -118,15 +121,21 @@ async function tick(){
     if(!d||!job){db.prepare('UPDATE schedules SET enabled=0,next_run_at=NULL WHERE id=1').run();return;}
     db.prepare("UPDATE deliveries SET status='sending',error=NULL WHERE id=?").run(job.delivery_id);
     try{
-      const form=new FormData();form.set('chat_id',d.chat_id);if(job.caption)form.set('caption',job.caption);
       const method=job.mime_type.startsWith('image/')?'sendPhoto':'sendVideo';const field=method==='sendPhoto'?'photo':'video';
-      const bytes=fs.readFileSync(path.join(UPLOAD_DIR,job.stored_name));form.set(field,new Blob([bytes],{type:job.mime_type}),job.original_name);
-      const r=await fetch(`https://api.telegram.org/bot${d.bot_token}/${method}`,{method:'POST',body:form});const j=await r.json();if(!j.ok)throw new Error(j.description||'Falha no Telegram');
+      let r;
+      if(LOCAL_BOT_API){
+        r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:d.chat_id,[field]:`file://${path.join(UPLOAD_DIR,job.stored_name)}`,...(job.caption?{caption:job.caption}:{})})});
+      }else{
+        const form=new FormData();form.set('chat_id',d.chat_id);if(job.caption)form.set('caption',job.caption);
+        const bytes=fs.readFileSync(path.join(UPLOAD_DIR,job.stored_name));form.set(field,new Blob([bytes],{type:job.mime_type}),job.original_name);
+        r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/${method}`,{method:'POST',body:form});
+      }
+      const j=await r.json();if(!j.ok)throw new Error(j.description||'Falha no Telegram');
       db.prepare("UPDATE deliveries SET status='sent',telegram_message_id=?,sent_at=CURRENT_TIMESTAMP WHERE id=?").run(String(j.result.message_id),job.delivery_id);
       db.prepare("UPDATE schedules SET sent_today=sent_today+1,next_run_at=datetime('now',? || ' minutes') WHERE id=1").run(`+${s.interval_minutes}`);
     }catch(e){db.prepare("UPDATE deliveries SET status='failed',error=? WHERE id=?").run(String(e.message).slice(0,500),job.delivery_id);db.prepare("UPDATE schedules SET next_run_at=datetime('now','+5 minutes') WHERE id=1").run();}
   }finally{ticking=false;}
 }
 setInterval(tick,15000);setTimeout(tick,2000);
-app.use((err,_req,res,_next)=>{console.error(err);res.status(err.code==='LIMIT_FILE_SIZE'?413:500).json({error:err.code==='LIMIT_FILE_SIZE'?'Arquivo maior que 50 MB':err.message||'Erro interno'});});
+app.use((err,_req,res,_next)=>{console.error(err);res.status(err.code==='LIMIT_FILE_SIZE'?413:500).json({error:err.code==='LIMIT_FILE_SIZE'?`Arquivo maior que ${MAX_FILE_MB} MB`:err.message||'Erro interno'});});
 app.listen(Number(process.env.PORT)||3000,'0.0.0.0',()=>console.log('AutoPost Telegram online'));
