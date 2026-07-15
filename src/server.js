@@ -143,6 +143,8 @@ async function tick(){
     if(!s.enabled||!s.destination_id||!s.next_run_at||new Date(s.next_run_at+'Z')>new Date())return;
     const today=new Date().toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'});
     if(s.day_key!==today){db.prepare('UPDATE schedules SET day_key=?,sent_today=0 WHERE id=1').run(today);s={...s,day_key:today,sent_today:0};}
+    const actualSentToday=db.prepare("SELECT COUNT(*) n FROM deliveries WHERE destination_id=? AND status='sent' AND date(sent_at,'-3 hours')=?").get(s.destination_id,today).n;
+    if(actualSentToday!==s.sent_today){db.prepare('UPDATE schedules SET sent_today=? WHERE id=1').run(actualSentToday);s={...s,sent_today:actualSentToday};}
     if(s.sent_today>=s.daily_limit){db.prepare("UPDATE schedules SET next_run_at=datetime('now','+1 day','start of day','+3 hours') WHERE id=1").run();return;}
     const d=db.prepare('SELECT * FROM destinations WHERE id=?').get(s.destination_id);
     const job=db.prepare(`SELECT d.id delivery_id,m.* FROM deliveries d JOIN media m ON m.id=d.media_id WHERE d.destination_id=? AND d.status IN ('pending','failed') ORDER BY CASE d.status WHEN 'pending' THEN 0 ELSE 1 END,d.id LIMIT 1`).get(s.destination_id);
