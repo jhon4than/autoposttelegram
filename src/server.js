@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Api, TelegramClient, sessions, utils } from 'teleproto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, name TEXT NOT N
 CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, original_name TEXT NOT NULL, stored_name TEXT UNIQUE NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, caption TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY, media_id INTEGER NOT NULL, destination_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', telegram_message_id TEXT, error TEXT, sent_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(media_id,destination_id), FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE, FOREIGN KEY(destination_id) REFERENCES destinations(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY CHECK(id=1), destination_id INTEGER, daily_limit INTEGER DEFAULT 20, interval_minutes INTEGER DEFAULT 5, enabled INTEGER DEFAULT 0, sent_today INTEGER DEFAULT 0, day_key TEXT, next_run_at TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(destination_id) REFERENCES destinations(id));
+CREATE TABLE IF NOT EXISTS telegram_accounts (id INTEGER PRIMARY KEY CHECK(id=1), phone TEXT, session_encrypted TEXT NOT NULL, connected_at TEXT DEFAULT CURRENT_TIMESTAMP);
 INSERT OR IGNORE INTO schedules(id) VALUES(1);
 `);
 
@@ -50,6 +52,13 @@ const upload = multer({ storage: multer.diskStorage({
 }), limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 100 }, fileFilter: (_req, file, cb) => cb(null, file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/')) });
 
 const tokenHash = t => crypto.createHash('sha256').update(t).digest('hex');
+const telegramApiId = Number(process.env.TELEGRAM_API_ID || 0);
+const telegramApiHash = process.env.TELEGRAM_API_HASH || '';
+const cipherKey = crypto.createHash('sha256').update(process.env.SESSION_SECRET || adminPassword).digest();
+const pendingTelegramLogins = new Map();
+function encrypt(value){const iv=crypto.randomBytes(12);const c=crypto.createCipheriv('aes-256-gcm',cipherKey,iv);const encrypted=Buffer.concat([c.update(value,'utf8'),c.final()]);return [iv,c.getAuthTag(),encrypted].map(x=>x.toString('base64url')).join('.');}
+function decrypt(value){const [a,b,c]=value.split('.').map(x=>Buffer.from(x,'base64url'));const d=crypto.createDecipheriv('aes-256-gcm',cipherKey,a);d.setAuthTag(b);return Buffer.concat([d.update(c),d.final()]).toString('utf8');}
+async function accountClient(){const row=db.prepare('SELECT session_encrypted FROM telegram_accounts WHERE id=1').get();if(!row)throw new Error('Conta do Telegram ainda não conectada');const client=new TelegramClient(new sessions.StringSession(decrypt(row.session_encrypted)),telegramApiId,telegramApiHash,{connectionRetries:5});await client.connect();return client;}
 function auth(req, res, next) {
   const token = req.cookies.apt_session;
   const row = token && db.prepare("SELECT * FROM sessions WHERE token_hash=? AND expires_at > datetime('now')").get(tokenHash(token));
@@ -96,6 +105,12 @@ app.post('/api/destinations',auth,async(req,res)=>{
   const id=db.prepare('INSERT INTO destinations(name,chat_id,bot_token) VALUES(?,?,?)').run(name,chatId,botToken).lastInsertRowid;
   res.json({ok:true,id});
 });
+app.get('/api/telegram/account',auth,(_req,res)=>{const row=db.prepare('SELECT phone,connected_at FROM telegram_accounts WHERE id=1').get();res.json({connected:!!row,...row});});
+app.post('/api/telegram/login/start',auth,async(req,res)=>{if(!telegramApiId||!telegramApiHash)return res.status(503).json({error:'API ID/Hash não configurados'});const phone=String(req.body.phone||'').replace(/[^+\d]/g,'');if(phone.length<10)return res.status(400).json({error:'Informe o número com DDI, exemplo +5511999999999'});try{const client=new TelegramClient(new sessions.StringSession(''),telegramApiId,telegramApiHash,{connectionRetries:5});await client.connect();const sent=await client.sendCode({apiId:telegramApiId,apiHash:telegramApiHash},phone);pendingTelegramLogins.set(req.userId,{client,phone,phoneCodeHash:sent.phoneCodeHash,expires:Date.now()+10*60e3});res.json({ok:true,viaApp:sent.isCodeViaApp});}catch(e){res.status(400).json({error:e.message||'Não foi possível enviar o código'});}});
+app.post('/api/telegram/login/confirm',auth,async(req,res)=>{const pending=pendingTelegramLogins.get(req.userId);if(!pending||pending.expires<Date.now())return res.status(400).json({error:'Código expirado. Solicite outro.'});try{await pending.client.invoke(new Api.auth.SignIn({phoneNumber:pending.phone,phoneCodeHash:pending.phoneCodeHash,phoneCode:String(req.body.code||'').replace(/\D/g,'')}));const saved=pending.client.session.save();db.prepare('INSERT INTO telegram_accounts(id,phone,session_encrypted) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET phone=excluded.phone,session_encrypted=excluded.session_encrypted,connected_at=CURRENT_TIMESTAMP').run(pending.phone,encrypt(saved));pendingTelegramLogins.delete(req.userId);await pending.client.disconnect();res.json({ok:true});}catch(e){if(String(e.errorMessage||e.message).includes('SESSION_PASSWORD_NEEDED'))return res.json({ok:false,passwordRequired:true});res.status(400).json({error:e.message||'Código inválido'});}});
+app.post('/api/telegram/login/password',auth,async(req,res)=>{const pending=pendingTelegramLogins.get(req.userId);if(!pending)return res.status(400).json({error:'Sessão de login expirada'});try{await pending.client.signInWithPassword({apiId:telegramApiId,apiHash:telegramApiHash},{password:async()=>String(req.body.password||''),onError:async e=>{throw e}});const saved=pending.client.session.save();db.prepare('INSERT INTO telegram_accounts(id,phone,session_encrypted) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET phone=excluded.phone,session_encrypted=excluded.session_encrypted,connected_at=CURRENT_TIMESTAMP').run(pending.phone,encrypt(saved));pendingTelegramLogins.delete(req.userId);await pending.client.disconnect();res.json({ok:true});}catch(e){res.status(400).json({error:e.message||'Senha de duas etapas inválida'});}});
+app.get('/api/telegram/dialogs',auth,async(_req,res)=>{let client;try{client=await accountClient();const dialogs=await client.getDialogs({limit:500});const items=dialogs.filter(d=>d.isGroup||d.isChannel).map(d=>({name:d.name||'Sem nome',chatId:String(utils.getPeerId(d.entity)),type:d.isChannel?'Canal / supergrupo':'Grupo'})).sort((a,b)=>a.name.localeCompare(b.name,'pt-BR'));res.json({items});}catch(e){res.status(400).json({error:e.message||'Não foi possível listar os grupos'});}finally{if(client)await client.disconnect();}});
+app.delete('/api/telegram/account',auth,async(_req,res)=>{db.prepare('DELETE FROM telegram_accounts WHERE id=1').run();res.json({ok:true});});
 app.delete('/api/destinations/:id',auth,(req,res)=>{db.prepare('DELETE FROM destinations WHERE id=?').run(req.params.id);res.json({ok:true});});
 app.post('/api/schedule',auth,(req,res)=>{
   const destinationId=Number(req.body.destinationId), daily=Math.max(1,Math.min(500,Number(req.body.dailyLimit)||20)), interval=Math.max(1,Math.min(1440,Number(req.body.intervalMinutes)||5));
