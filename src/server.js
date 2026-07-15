@@ -77,7 +77,9 @@ function publicStats() {
   const totals = db.prepare("SELECT COUNT(*) total, COALESCE(SUM(size),0) bytes FROM media").get();
   const sent = db.prepare("SELECT COUNT(*) n FROM deliveries WHERE status='sent'").get().n;
   const pending = db.prepare("SELECT COUNT(*) n FROM deliveries WHERE status='pending'").get().n;
-  return { ...totals, sent, pending };
+  let disk={total:0,used:0,free:0,percent:0};
+  try{const stat=fs.statfsSync(DATA_DIR);const total=Number(stat.blocks)*Number(stat.bsize);const free=Number(stat.bavail)*Number(stat.bsize);const used=Math.max(0,total-free);disk={total,used,free,percent:total?Math.round(used/total*1000)/10:0};}catch{}
+  return { ...totals, sent, pending, disk };
 }
 
 app.get('/api/health', (_req,res)=>res.json({ok:true,localBotApi:LOCAL_BOT_API,maxFileMb:MAX_FILE_MB}));
