@@ -198,6 +198,7 @@ async function runSourceWorker(){
             }
             const stat=fs.statSync(target);if(!stat.size)throw new Error('Arquivo baixado vazio');
             db.transaction(()=>{const existing=db.prepare('SELECT id FROM media WHERE stored_name=?').get(stored);const mediaId=existing?.id||db.prepare('INSERT INTO media(original_name,stored_name,mime_type,size,caption) VALUES(?,?,?,?,?)').run(original,stored,message.document?.mimeType||'video/mp4',stat.size,String(message.message||'').slice(0,1024)).lastInsertRowid;db.prepare('INSERT OR IGNORE INTO source_imports(source_id,message_id,media_id) VALUES(?,?,?)').run(source.id,message.id,mediaId);db.prepare('DELETE FROM source_failures WHERE source_id=? AND message_id=?').run(source.id,message.id);})();
+            db.prepare('UPDATE sources SET last_error=NULL WHERE id=?').run(source.id);
             sourceLog(source.id,'success','download_completed',`${original} salvo na biblioteca.`,message.id);
           }catch(e){
             try{if(fs.existsSync(target)&&fs.statSync(target).size===0)fs.unlinkSync(target)}catch{}
