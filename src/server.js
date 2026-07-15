@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY CHECK(id=1), destin
 CREATE TABLE IF NOT EXISTS telegram_accounts (id INTEGER PRIMARY KEY CHECK(id=1), phone TEXT, session_encrypted TEXT NOT NULL, connected_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS sources (id INTEGER PRIMARY KEY, peer_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, enabled INTEGER DEFAULT 1, history_limit INTEGER DEFAULT 100, initial_import_done INTEGER DEFAULT 0, last_message_id INTEGER DEFAULT 0, last_checked_at TEXT, last_error TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS source_imports (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, message_id INTEGER NOT NULL, media_id INTEGER, imported_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(source_id,message_id), FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE, FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS source_failures (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, message_id INTEGER NOT NULL, attempts INTEGER DEFAULT 1, next_retry_at TEXT NOT NULL, last_error TEXT, UNIQUE(source_id,message_id), FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS source_logs (id INTEGER PRIMARY KEY, source_id INTEGER, level TEXT NOT NULL DEFAULT 'info', event TEXT NOT NULL, message TEXT NOT NULL, message_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE SET NULL);
 INSERT OR IGNORE INTO schedules(id) VALUES(1);
 `);
 
@@ -58,9 +60,13 @@ const telegramApiId = Number(process.env.TELEGRAM_API_ID || 0);
 const telegramApiHash = process.env.TELEGRAM_API_HASH || '';
 const cipherKey = crypto.createHash('sha256').update(process.env.SESSION_SECRET || adminPassword).digest();
 const pendingTelegramLogins = new Map();
+const SOURCE_DOWNLOAD_DELAY_SECONDS=Math.max(10,Number(process.env.SOURCE_DOWNLOAD_DELAY_SECONDS)||30);
+const SOURCE_RETRY_SAFETY_SECONDS=Math.max(10,Number(process.env.SOURCE_RETRY_SAFETY_SECONDS)||20);
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function sourceLog(sourceId,level,event,message,messageId=null){db.prepare('INSERT INTO source_logs(source_id,level,event,message,message_id) VALUES(?,?,?,?,?)').run(sourceId||null,level,event,String(message).slice(0,1000),messageId);db.prepare('DELETE FROM source_logs WHERE id NOT IN (SELECT id FROM source_logs ORDER BY id DESC LIMIT 2000)').run();}
 function encrypt(value){const iv=crypto.randomBytes(12);const c=crypto.createCipheriv('aes-256-gcm',cipherKey,iv);const encrypted=Buffer.concat([c.update(value,'utf8'),c.final()]);return [iv,c.getAuthTag(),encrypted].map(x=>x.toString('base64url')).join('.');}
 function decrypt(value){const [a,b,c]=value.split('.').map(x=>Buffer.from(x,'base64url'));const d=crypto.createDecipheriv('aes-256-gcm',cipherKey,a);d.setAuthTag(b);return Buffer.concat([d.update(c),d.final()]).toString('utf8');}
-async function accountClient(){const row=db.prepare('SELECT session_encrypted FROM telegram_accounts WHERE id=1').get();if(!row)throw new Error('Conta do Telegram ainda não conectada');const client=new TelegramClient(new sessions.StringSession(decrypt(row.session_encrypted)),telegramApiId,telegramApiHash,{connectionRetries:5});await client.connect();return client;}
+async function accountClient(){const row=db.prepare('SELECT session_encrypted FROM telegram_accounts WHERE id=1').get();if(!row)throw new Error('Conta do Telegram ainda não conectada');const client=new TelegramClient(new sessions.StringSession(decrypt(row.session_encrypted)),telegramApiId,telegramApiHash,{connectionRetries:5});client.floodSleepThreshold=300;client.maxConcurrentDownloads=1;await client.connect();return client;}
 function auth(req, res, next) {
   const token = req.cookies.apt_session;
   const row = token && db.prepare("SELECT * FROM sessions WHERE token_hash=? AND expires_at > datetime('now')").get(tokenHash(token));
@@ -113,10 +119,10 @@ app.post('/api/telegram/login/confirm',auth,async(req,res)=>{const pending=pendi
 app.post('/api/telegram/login/password',auth,async(req,res)=>{const pending=pendingTelegramLogins.get(req.userId);if(!pending)return res.status(400).json({error:'Sessão de login expirada'});try{await pending.client.signInWithPassword({apiId:telegramApiId,apiHash:telegramApiHash},{password:async()=>String(req.body.password||''),onError:async e=>{throw e}});const saved=pending.client.session.save();db.prepare('INSERT INTO telegram_accounts(id,phone,session_encrypted) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET phone=excluded.phone,session_encrypted=excluded.session_encrypted,connected_at=CURRENT_TIMESTAMP').run(pending.phone,encrypt(saved));pendingTelegramLogins.delete(req.userId);await pending.client.disconnect();res.json({ok:true});}catch(e){res.status(400).json({error:e.message||'Senha de duas etapas inválida'});}});
 app.get('/api/telegram/dialogs',auth,async(_req,res)=>{let client;try{client=await accountClient();const dialogs=await client.getDialogs({limit:500});const items=dialogs.filter(d=>d.isGroup||d.isChannel).map(d=>({name:d.name||'Sem nome',chatId:String(utils.getPeerId(d.entity)),type:d.isChannel?'Canal / supergrupo':'Grupo',protected:!!d.entity?.noforwards})).sort((a,b)=>a.name.localeCompare(b.name,'pt-BR'));res.json({items});}catch(e){res.status(400).json({error:e.message||'Não foi possível listar os grupos'});}finally{if(client)await client.disconnect();}});
 app.delete('/api/telegram/account',auth,async(_req,res)=>{db.prepare('DELETE FROM telegram_accounts WHERE id=1').run();res.json({ok:true});});
-app.get('/api/sources',auth,(_req,res)=>{const items=db.prepare(`SELECT s.*,(SELECT COUNT(*) FROM source_imports i WHERE i.source_id=s.id AND i.media_id IS NOT NULL) imported_count FROM sources s ORDER BY s.id DESC`).all();res.json({items,running:sourceWorkerRunning});});
+app.get('/api/sources',auth,(_req,res)=>{const items=db.prepare(`SELECT s.*,(SELECT COUNT(*) FROM source_imports i WHERE i.source_id=s.id AND i.media_id IS NOT NULL) imported_count FROM sources s ORDER BY s.id DESC`).all();const logs=db.prepare(`SELECT l.*,COALESCE(s.name,'Sistema') source_name FROM source_logs l LEFT JOIN sources s ON s.id=l.source_id ORDER BY l.id DESC LIMIT 100`).all();res.json({items,logs,running:sourceWorkerRunning,downloadDelaySeconds:SOURCE_DOWNLOAD_DELAY_SECONDS});});
 app.post('/api/sources',auth,async(req,res)=>{const peerId=String(req.body.peerId||''),name=String(req.body.name||'').trim(),historyLimit=Number(req.body.historyLimit);if(!peerId||!name)return res.status(400).json({error:'Fonte inválida'});if(![-1,0,50,100,500,1000].includes(historyLimit))return res.status(400).json({error:'Quantidade de histórico inválida'});let client;try{client=await accountClient();const entity=await client.getEntity(peerId);if(entity?.noforwards)return res.status(400).json({error:'Este canal protege o conteúdo e não pode ser importado'});let last=0,done=0;if(historyLimit===0){const messages=await client.getMessages(peerId,{limit:1});last=messages[0]?.id||0;done=1;}const id=db.prepare('INSERT INTO sources(peer_id,name,history_limit,initial_import_done,last_message_id) VALUES(?,?,?,?,?) ON CONFLICT(peer_id) DO UPDATE SET name=excluded.name,history_limit=excluded.history_limit,enabled=1 RETURNING id').get(peerId,name,historyLimit,done,last).id;res.json({ok:true,id});setTimeout(runSourceWorker,100);}catch(e){res.status(400).json({error:e.message||'Não foi possível adicionar a fonte'});}finally{if(client)await client.disconnect();}});
 app.post('/api/sources/:id/toggle',auth,(req,res)=>{db.prepare('UPDATE sources SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?').run(req.params.id);res.json({ok:true});setTimeout(runSourceWorker,100);});
-app.post('/api/sources/run',auth,(_req,res)=>{setTimeout(runSourceWorker,50);res.json({ok:true});});
+app.post('/api/sources/run',auth,(_req,res)=>{if(sourceWorkerRunning)return res.json({ok:true,alreadyRunning:true});setTimeout(runSourceWorker,50);res.json({ok:true});});
 app.delete('/api/sources/:id',auth,(req,res)=>{db.prepare('DELETE FROM sources WHERE id=?').run(req.params.id);res.json({ok:true});});
 app.delete('/api/destinations/:id',auth,(req,res)=>{db.prepare('DELETE FROM destinations WHERE id=?').run(req.params.id);res.json({ok:true});});
 app.post('/api/schedule',auth,(req,res)=>{
@@ -164,27 +170,46 @@ async function runSourceWorker(){
   if(sourceWorkerRunning)return;const sourcesToRun=db.prepare('SELECT * FROM sources WHERE enabled=1 ORDER BY id').all();if(!sourcesToRun.length)return;sourceWorkerRunning=true;let client;
   try{
     client=await accountClient();
+    sourceLog(null,'info','worker_started',`Verificação iniciada para ${sourcesToRun.length} fonte(s). Intervalo entre downloads: ${SOURCE_DOWNLOAD_DELAY_SECONDS}s.`);
     for(const source of sourcesToRun){
       let highest=source.last_message_id||0;
       try{
+        sourceLog(source.id,'info','source_check',`Verificando ${source.name}.`);
         const limit=source.initial_import_done?undefined:(source.history_limit===-1?undefined:source.history_limit);
         const params=source.initial_import_done?{minId:source.last_message_id,reverse:true,limit:undefined}:{limit};
         for await(const message of client.iterMessages(source.peer_id,params)){
           highest=Math.max(highest,Number(message.id)||0);
-          if(message.noforwards||!message.video)continue;
+          if(message.noforwards){sourceLog(source.id,'warning','protected_skipped','Mensagem protegida ignorada.',message.id);continue;}
+          if(!message.video)continue;
           if(db.prepare('SELECT 1 FROM source_imports WHERE source_id=? AND message_id=?').get(source.id,message.id))continue;
-          const size=Number(message.file?.size||message.document?.size||0);if(size>MAX_FILE_MB*1024*1024){db.prepare('INSERT OR IGNORE INTO source_imports(source_id,message_id) VALUES(?,?)').run(source.id,message.id);continue;}
+          const failure=db.prepare("SELECT * FROM source_failures WHERE source_id=? AND message_id=? AND next_retry_at > CURRENT_TIMESTAMP").get(source.id,message.id);if(failure)continue;
+          const size=Number(message.file?.size||message.document?.size||0);if(size>MAX_FILE_MB*1024*1024){db.prepare('INSERT OR IGNORE INTO source_imports(source_id,message_id) VALUES(?,?)').run(source.id,message.id);sourceLog(source.id,'warning','oversize_skipped',`Vídeo maior que ${MAX_FILE_MB} MB ignorado.`,message.id);continue;}
           const original=(message.file?.name||`${source.name}-${message.id}.mp4`).replace(/[\\/:*?"<>|]/g,'_');
-          const stored=`telegram-${source.id}-${message.id}-${crypto.randomUUID()}${path.extname(original)||'.mp4'}`;const target=path.join(UPLOAD_DIR,stored);
+          const stored=`telegram-${source.id}-${message.id}${path.extname(original)||'.mp4'}`;const target=path.join(UPLOAD_DIR,stored);
           try{
-            await client.downloadMedia(message,{outputFile:target});
-            const stat=fs.statSync(target);const info=db.transaction(()=>{const mediaId=db.prepare('INSERT INTO media(original_name,stored_name,mime_type,size,caption) VALUES(?,?,?,?,?)').run(original,stored,message.document?.mimeType||'video/mp4',stat.size,String(message.message||'').slice(0,1024)).lastInsertRowid;db.prepare('INSERT INTO source_imports(source_id,message_id,media_id) VALUES(?,?,?)').run(source.id,message.id,mediaId);return mediaId;})();
-          }catch(e){try{fs.unlinkSync(target)}catch{}throw e;}
+            sourceLog(source.id,'info','download_started',`Baixando ${original}${size?` (${Math.round(size/1048576)} MB)`:''}.`,message.id);
+            if(!fs.existsSync(target)||fs.statSync(target).size===0){
+              let downloaded=false,lastDownloadError;
+              for(let attempt=1;attempt<=4&&!downloaded;attempt++){
+                try{await client.downloadMedia(message,{outputFile:target});downloaded=true;}
+                catch(e){lastDownloadError=e;const text=String(e.errorMessage||e.message||e);const match=text.match(/(?:FLOOD_WAIT_|wait\s+)(\d+)/i);if(match){const waitSeconds=Number(match[1])+SOURCE_RETRY_SAFETY_SECONDS;sourceLog(source.id,'warning','flood_wait',`Telegram pediu ${match[1]}s de pausa; aguardando ${waitSeconds}s antes de tentar novamente.`,message.id);await sleep(waitSeconds*1000);}else if(attempt<4){const waitSeconds=SOURCE_DOWNLOAD_DELAY_SECONDS*attempt;sourceLog(source.id,'warning','download_retry',`Tentativa ${attempt} falhou; nova tentativa em ${waitSeconds}s.`,message.id);await sleep(waitSeconds*1000);}}
+              }
+              if(!downloaded)throw lastDownloadError||new Error('Download não concluído');
+            }
+            const stat=fs.statSync(target);if(!stat.size)throw new Error('Arquivo baixado vazio');
+            db.transaction(()=>{const existing=db.prepare('SELECT id FROM media WHERE stored_name=?').get(stored);const mediaId=existing?.id||db.prepare('INSERT INTO media(original_name,stored_name,mime_type,size,caption) VALUES(?,?,?,?,?)').run(original,stored,message.document?.mimeType||'video/mp4',stat.size,String(message.message||'').slice(0,1024)).lastInsertRowid;db.prepare('INSERT OR IGNORE INTO source_imports(source_id,message_id,media_id) VALUES(?,?,?)').run(source.id,message.id,mediaId);db.prepare('DELETE FROM source_failures WHERE source_id=? AND message_id=?').run(source.id,message.id);})();
+            sourceLog(source.id,'success','download_completed',`${original} salvo na biblioteca.`,message.id);
+          }catch(e){
+            try{if(fs.existsSync(target)&&fs.statSync(target).size===0)fs.unlinkSync(target)}catch{}
+            const error=String(e.errorMessage||e.message||e).slice(0,500);db.prepare("INSERT INTO source_failures(source_id,message_id,attempts,next_retry_at,last_error) VALUES(?,?,1,datetime('now','+15 minutes'),?) ON CONFLICT(source_id,message_id) DO UPDATE SET attempts=attempts+1,next_retry_at=datetime('now',CASE WHEN attempts>=3 THEN '+60 minutes' ELSE '+15 minutes' END),last_error=excluded.last_error").run(source.id,message.id,error);sourceLog(source.id,'error','download_failed',`Falha após as tentativas: ${error}. Nova tentativa será feita depois.`,message.id);
+          }
+          await sleep(SOURCE_DOWNLOAD_DELAY_SECONDS*1000);
         }
         db.prepare('UPDATE sources SET initial_import_done=1,last_message_id=?,last_checked_at=CURRENT_TIMESTAMP,last_error=NULL WHERE id=?').run(highest,source.id);
-      }catch(e){db.prepare('UPDATE sources SET last_checked_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?').run(String(e.message||e).slice(0,500),source.id);}
+        sourceLog(source.id,'success','source_complete',`Verificação concluída até a mensagem ${highest}.`);
+      }catch(e){const error=String(e.errorMessage||e.message||e).slice(0,500);db.prepare('UPDATE sources SET last_checked_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?').run(error,source.id);sourceLog(source.id,'error','source_failed',error);}
     }
-  }catch(e){console.error('Source worker:',e.message);}finally{if(client)await client.disconnect();sourceWorkerRunning=false;}
+  }catch(e){console.error('Source worker:',e.message);sourceLog(null,'error','worker_failed',e.message);}finally{if(client)await client.disconnect();sourceWorkerRunning=false;sourceLog(null,'info','worker_stopped','Verificação finalizada.');}
 }
 setInterval(runSourceWorker,60000);setTimeout(runSourceWorker,5000);
 app.use((err,_req,res,_next)=>{console.error(err);res.status(err.code==='LIMIT_FILE_SIZE'?413:500).json({error:err.code==='LIMIT_FILE_SIZE'?`Arquivo maior que ${MAX_FILE_MB} MB`:err.message||'Erro interno'});});
