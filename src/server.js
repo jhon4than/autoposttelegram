@@ -7,12 +7,15 @@ import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Api, TelegramClient, sessions, utils } from 'teleproto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const THUMBNAIL_DIR = path.join(DATA_DIR, 'thumbnails');
 const MAX_FILE_MB = Math.max(1, Number(process.env.MAX_FILE_MB) || 2000);
 const SOURCE_MAX_FILE_MB = Math.max(1, Number(process.env.SOURCE_MAX_FILE_MB) || 400);
 const MIN_FREE_DISK_GB = Math.max(1, Number(process.env.MIN_FREE_DISK_GB) || 5);
@@ -20,6 +23,8 @@ const MIN_FREE_DISK_BYTES = MIN_FREE_DISK_GB * 1024 * 1024 * 1024;
 const TELEGRAM_API_BASE = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/$/, '');
 const LOCAL_BOT_API = !TELEGRAM_API_BASE.includes('api.telegram.org');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
+const execFileAsync = promisify(execFile);
 const db = new Database(path.join(DATA_DIR, 'autopost.sqlite'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -86,6 +91,18 @@ function publicStats() {
   return { ...totals, sent, pending, disk };
 }
 
+async function videoTelegramMetadata(storedName){
+  const input=path.join(UPLOAD_DIR,storedName);const thumbnail=path.join(THUMBNAIL_DIR,`${storedName}.jpg`);
+  try{
+    const {stdout}=await execFileAsync('ffprobe',['-v','error','-select_streams','v:0','-show_entries','stream=width,height:format=duration','-of','json',input],{maxBuffer:1024*1024});
+    const info=JSON.parse(stdout);const stream=info.streams?.[0]||{};const duration=Math.max(0,Math.round(Number(info.format?.duration)||0));
+    if(!fs.existsSync(thumbnail)||fs.statSync(thumbnail).size===0){
+      await execFileAsync('ffmpeg',['-y','-ss',duration>2?'1':'0','-i',input,'-frames:v','1','-vf','scale=320:320:force_original_aspect_ratio=decrease','-q:v','5',thumbnail],{maxBuffer:2*1024*1024});
+    }
+    const result={supports_streaming:true};if(duration)result.duration=duration;if(stream.width)result.width=Number(stream.width);if(stream.height)result.height=Number(stream.height);if(fs.existsSync(thumbnail)&&fs.statSync(thumbnail).size>0)result.thumbnail=`file://${thumbnail}`;return result;
+  }catch(e){console.warn(`Prévia não gerada para ${storedName}:`,e.message);return {supports_streaming:true};}
+}
+
 app.get('/api/health', (_req,res)=>res.json({ok:true,localBotApi:LOCAL_BOT_API,maxFileMb:MAX_FILE_MB}));
 app.get('/login', (req,res)=> req.cookies.apt_session ? res.redirect('/') : res.sendFile(path.join(__dirname,'public','login.html')));
 app.post('/api/login', (req,res)=>{
@@ -110,7 +127,7 @@ app.post('/api/media',auth,upload.array('files',100),(req,res)=>{
   res.json({ok:true,ids:tx(req.files||[])});
 });
 app.get('/api/media/:id/file',auth,(req,res)=>{const m=db.prepare('SELECT * FROM media WHERE id=?').get(req.params.id);if(!m)return res.sendStatus(404);res.type(m.mime_type).sendFile(path.join(UPLOAD_DIR,m.stored_name));});
-app.delete('/api/media/:id',auth,(req,res)=>{const m=db.prepare('SELECT * FROM media WHERE id=?').get(req.params.id);if(!m)return res.sendStatus(404);db.prepare('DELETE FROM media WHERE id=?').run(m.id);try{fs.unlinkSync(path.join(UPLOAD_DIR,m.stored_name))}catch{}res.json({ok:true});});
+app.delete('/api/media/:id',auth,(req,res)=>{const m=db.prepare('SELECT * FROM media WHERE id=?').get(req.params.id);if(!m)return res.sendStatus(404);db.prepare('DELETE FROM media WHERE id=?').run(m.id);try{fs.unlinkSync(path.join(UPLOAD_DIR,m.stored_name))}catch{}try{fs.unlinkSync(path.join(THUMBNAIL_DIR,`${m.stored_name}.jpg`))}catch{}res.json({ok:true});});
 app.post('/api/destinations',auth,async(req,res)=>{
   const {name,chatId,botToken}=req.body;
   if(!name||!chatId||!botToken)return res.status(400).json({error:'Preencha nome, grupo e token'});
@@ -157,13 +174,14 @@ async function tick(){
     if(!d||!job){db.prepare('UPDATE schedules SET enabled=0,next_run_at=NULL WHERE id=1').run();return;}
     db.prepare("UPDATE deliveries SET status='sending',error=NULL WHERE id=?").run(job.delivery_id);
     try{
-      const method=job.mime_type.startsWith('image/')?'sendPhoto':'sendVideo';const field=method==='sendPhoto'?'photo':'video';
+      const method=job.mime_type.startsWith('image/')?'sendPhoto':'sendVideo';const field=method==='sendPhoto'?'photo':'video';const videoMetadata=method==='sendVideo'?await videoTelegramMetadata(job.stored_name):{};
       let r;
       if(LOCAL_BOT_API){
-        r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:d.chat_id,[field]:`file://${path.join(UPLOAD_DIR,job.stored_name)}`,...(job.caption?{caption:job.caption}:{})})});
+        r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:d.chat_id,[field]:`file://${path.join(UPLOAD_DIR,job.stored_name)}`,...videoMetadata,...(job.caption?{caption:job.caption}:{})})});
       }else{
-        const form=new FormData();form.set('chat_id',d.chat_id);if(job.caption)form.set('caption',job.caption);
+        const form=new FormData();form.set('chat_id',d.chat_id);if(job.caption)form.set('caption',job.caption);for(const [key,value] of Object.entries(videoMetadata)){if(key!=='thumbnail')form.set(key,String(value));}
         const bytes=fs.readFileSync(path.join(UPLOAD_DIR,job.stored_name));form.set(field,new Blob([bytes],{type:job.mime_type}),job.original_name);
+        if(videoMetadata.thumbnail){const thumbnailPath=videoMetadata.thumbnail.replace(/^file:\/\//,'');form.set('thumbnail',new Blob([fs.readFileSync(thumbnailPath)],{type:'image/jpeg'}),'thumbnail.jpg');}
         r=await fetch(`${TELEGRAM_API_BASE}/bot${d.bot_token}/${method}`,{method:'POST',body:form});
       }
       const j=await r.json();if(!j.ok)throw new Error(j.description||'Falha no Telegram');
