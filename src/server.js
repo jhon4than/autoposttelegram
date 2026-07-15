@@ -14,6 +14,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const MAX_FILE_MB = Math.max(1, Number(process.env.MAX_FILE_MB) || 2000);
+const MIN_FREE_DISK_GB = Math.max(1, Number(process.env.MIN_FREE_DISK_GB) || 5);
+const MIN_FREE_DISK_BYTES = MIN_FREE_DISK_GB * 1024 * 1024 * 1024;
 const TELEGRAM_API_BASE = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/$/, '');
 const LOCAL_BOT_API = !TELEGRAM_API_BASE.includes('api.telegram.org');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -64,6 +66,7 @@ const SOURCE_DOWNLOAD_DELAY_SECONDS=Math.max(10,Number(process.env.SOURCE_DOWNLO
 const SOURCE_RETRY_SAFETY_SECONDS=Math.max(10,Number(process.env.SOURCE_RETRY_SAFETY_SECONDS)||20);
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function sourceLog(sourceId,level,event,message,messageId=null){db.prepare('INSERT INTO source_logs(source_id,level,event,message,message_id) VALUES(?,?,?,?,?)').run(sourceId||null,level,event,String(message).slice(0,1000),messageId);db.prepare('DELETE FROM source_logs WHERE id NOT IN (SELECT id FROM source_logs ORDER BY id DESC LIMIT 2000)').run();}
+function sourceLogOnce(sourceId,level,event,message,messageId=null){const exists=db.prepare("SELECT 1 FROM source_logs WHERE source_id IS ? AND event=? AND message_id IS ? AND created_at >= datetime('now','-30 minutes') LIMIT 1").get(sourceId||null,event,messageId);if(!exists)sourceLog(sourceId,level,event,message,messageId);}
 function encrypt(value){const iv=crypto.randomBytes(12);const c=crypto.createCipheriv('aes-256-gcm',cipherKey,iv);const encrypted=Buffer.concat([c.update(value,'utf8'),c.final()]);return [iv,c.getAuthTag(),encrypted].map(x=>x.toString('base64url')).join('.');}
 function decrypt(value){const [a,b,c]=value.split('.').map(x=>Buffer.from(x,'base64url'));const d=crypto.createDecipheriv('aes-256-gcm',cipherKey,a);d.setAuthTag(b);return Buffer.concat([d.update(c),d.final()]).toString('utf8');}
 async function accountClient(){const row=db.prepare('SELECT session_encrypted FROM telegram_accounts WHERE id=1').get();if(!row)throw new Error('Conta do Telegram ainda não conectada');const client=new TelegramClient(new sessions.StringSession(decrypt(row.session_encrypted)),telegramApiId,telegramApiHash,{connectionRetries:5});client.floodSleepThreshold=300;client.maxConcurrentDownloads=1;await client.connect();return client;}
@@ -78,7 +81,7 @@ function publicStats() {
   const sent = db.prepare("SELECT COUNT(*) n FROM deliveries WHERE status='sent'").get().n;
   const pending = db.prepare("SELECT COUNT(*) n FROM deliveries WHERE status='pending'").get().n;
   let disk={total:0,used:0,free:0,percent:0};
-  try{const stat=fs.statfsSync(DATA_DIR);const total=Number(stat.blocks)*Number(stat.bsize);const free=Number(stat.bavail)*Number(stat.bsize);const used=Math.max(0,total-free);disk={total,used,free,percent:total?Math.round(used/total*1000)/10:0};}catch{}
+  try{const stat=fs.statfsSync(DATA_DIR);const total=Number(stat.blocks)*Number(stat.bsize);const free=Number(stat.bavail)*Number(stat.bsize);const used=Math.max(0,total-free);disk={total,used,free,percent:total?Math.round(used/total*1000)/10:0,minFree:MIN_FREE_DISK_BYTES,downloadsPaused:free<=MIN_FREE_DISK_BYTES};}catch{}
   return { ...totals, sent, pending, disk };
 }
 
@@ -188,6 +191,7 @@ async function runSourceWorker(){
           if(db.prepare('SELECT 1 FROM source_imports WHERE source_id=? AND message_id=?').get(source.id,message.id))continue;
           const failure=db.prepare("SELECT * FROM source_failures WHERE source_id=? AND message_id=? AND next_retry_at > CURRENT_TIMESTAMP").get(source.id,message.id);if(failure)continue;
           const size=Number(message.file?.size||message.document?.size||0);if(size>MAX_FILE_MB*1024*1024){db.prepare('INSERT OR IGNORE INTO source_imports(source_id,message_id) VALUES(?,?)').run(source.id,message.id);sourceLog(source.id,'warning','oversize_skipped',`Vídeo maior que ${MAX_FILE_MB} MB ignorado.`,message.id);continue;}
+          const diskStat=fs.statfsSync(DATA_DIR);const diskFree=Number(diskStat.bavail)*Number(diskStat.bsize);if(diskFree-size<MIN_FREE_DISK_BYTES){const error=new Error(`Download pausado: é necessário preservar ${MIN_FREE_DISK_GB} GB livres. Espaço atual: ${(diskFree/1073741824).toFixed(1)} GB.`);error.code='STORAGE_GUARD';throw error;}
           const original=(message.file?.name||`${source.name}-${message.id}.mp4`).replace(/[\\/:*?"<>|]/g,'_');
           const stored=`telegram-${source.id}-${message.id}${path.extname(original)||'.mp4'}`;const target=path.join(UPLOAD_DIR,stored);
           try{
@@ -212,7 +216,7 @@ async function runSourceWorker(){
         }
         db.prepare('UPDATE sources SET initial_import_done=1,last_message_id=?,last_checked_at=CURRENT_TIMESTAMP,last_error=NULL WHERE id=?').run(highest,source.id);
         sourceLog(source.id,'success','source_complete',`Verificação concluída até a mensagem ${highest}.`);
-      }catch(e){const error=String(e.errorMessage||e.message||e).slice(0,500);db.prepare('UPDATE sources SET last_checked_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?').run(error,source.id);sourceLog(source.id,'error','source_failed',error);}
+      }catch(e){const error=String(e.errorMessage||e.message||e).slice(0,500);db.prepare('UPDATE sources SET last_checked_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?').run(error,source.id);if(e.code==='STORAGE_GUARD')sourceLogOnce(source.id,'warning','storage_guard',error);else sourceLog(source.id,'error','source_failed',error);}
     }
   }catch(e){console.error('Source worker:',e.message);sourceLog(null,'error','worker_failed',e.message);}finally{if(client)await client.disconnect();sourceWorkerRunning=false;sourceLog(null,'info','worker_stopped','Verificação finalizada.');}
 }
