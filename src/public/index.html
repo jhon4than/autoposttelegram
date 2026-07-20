@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>AutoPost Telegram</title>
-    <link rel="stylesheet" href="/assets/style.css?v=20260720-library" />
+    <link rel="stylesheet" href="/assets/style.css?v=20260720-library-v2" />
   </head>
   <body>
     <header>
@@ -123,15 +123,22 @@
         <div id="libraryToolbar" class="library-toolbar">
           <label class="select-page">
             <input id="selectPage" type="checkbox" />
-            Selecionar esta página
+            Selecionar os vídeos desta página
           </label>
           <div class="selection-actions">
+            <label class="sort-control">
+              Ordenar
+              <select id="librarySort">
+                <option value="newest">Mais novos primeiro</option>
+                <option value="oldest">Mais antigos primeiro</option>
+              </select>
+            </label>
             <span id="selectionCount">0 selecionados</span>
             <button id="clearSelection" class="ghost" type="button">
               Limpar
             </button>
             <button id="deleteSelected" class="danger" type="button" disabled>
-              Excluir selecionados
+              Excluir da página
             </button>
           </div>
         </div>
@@ -210,7 +217,7 @@
       </form>
     </dialog>
     <div id="toast"></div>
-    <script src="/assets/app.js?v=20260720-library"></script>
+    <script src="/assets/app.js?v=20260720-library-v2"></script>
     <script src="/assets/telegram.js"></script>
     <script src="/assets/sources.js"></script>
     <script src="/assets/schedule-status.js"></script>

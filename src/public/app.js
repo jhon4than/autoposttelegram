@@ -1,5 +1,11 @@
 let state = { media: [], destinations: [], schedule: {} };
-let library = { items: [], page: 1, pages: 1, total: 0 };
+let library = {
+  items: [],
+  page: 1,
+  pages: 1,
+  total: 0,
+  sort: "newest",
+};
 const selectedMedia = new Set();
 const $ = (s) => document.querySelector(s);
 const fmt = (b) =>
@@ -25,14 +31,18 @@ async function api(url, opt = {}) {
 async function load() {
   const [newState, newLibrary] = await Promise.all([
     api("/api/state"),
-    api(`/api/media?page=${library.page}&pageSize=24`),
+    api(
+      `/api/media?page=${library.page}&pageSize=20&sort=${library.sort || "newest"}`,
+    ),
   ]);
   state = newState;
   library = newLibrary;
   render();
 }
 async function loadLibrary(page = library.page) {
-  library = await api(`/api/media?page=${page}&pageSize=24`);
+  library = await api(
+    `/api/media?page=${page}&pageSize=20&sort=${library.sort || "newest"}`,
+  );
   renderLibrary();
 }
 function render() {
@@ -69,6 +79,10 @@ function render() {
     empty("Nenhum grupo ou canal configurado.");
 }
 function renderLibrary() {
+  const pageIdSet = new Set(library.items.map((item) => item.id));
+  for (const id of selectedMedia) {
+    if (!pageIdSet.has(id)) selectedMedia.delete(id);
+  }
   mediaGrid.innerHTML =
     library.items.map(mediaCard).join("") ||
     empty("Arraste seus primeiros vídeos ou imagens.");
@@ -80,6 +94,7 @@ function renderLibrary() {
   selectionCount.textContent = `${selectedMedia.size} selecionado${selectedMedia.size === 1 ? "" : "s"}`;
   deleteSelected.disabled = selectedMedia.size === 0;
   clearSelection.hidden = selectedMedia.size === 0;
+  librarySort.value = library.sort || "newest";
   libraryPagination.innerHTML = library.total
     ? `<button class="page-button" type="button" onclick="changeLibraryPage(${library.page - 1})" ${library.page <= 1 ? "disabled" : ""}>← Anterior</button><span class="page-status">Página ${library.page} de ${library.pages} · ${library.total} arquivos</span><button class="page-button" type="button" onclick="changeLibraryPage(${library.page + 1})" ${library.page >= library.pages ? "disabled" : ""}>Próxima →</button>`
     : "";
@@ -117,12 +132,18 @@ selectPage.onchange = () => {
   }
   renderLibrary();
 };
+librarySort.onchange = async () => {
+  selectedMedia.clear();
+  library.sort = librarySort.value;
+  await loadLibrary(1);
+};
 clearSelection.onclick = () => {
   selectedMedia.clear();
   renderLibrary();
 };
 async function changeLibraryPage(page) {
   if (page < 1 || page > library.pages || page === library.page) return;
+  selectedMedia.clear();
   await loadLibrary(page);
   libraryToolbar.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -131,7 +152,7 @@ deleteSelected.onclick = async () => {
   if (!ids.length) return;
   if (
     !confirm(
-      `Excluir definitivamente ${ids.length} arquivo${ids.length === 1 ? "" : "s"}? Esta ação também remove esses itens da fila.`,
+      `Excluir definitivamente ${ids.length} arquivo${ids.length === 1 ? "" : "s"} desta página? Esta ação também remove esses itens da fila.`,
     )
   )
     return;

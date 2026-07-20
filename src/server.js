@@ -314,16 +314,18 @@ app.get("/api/state", auth, (_req, res) => {
   res.json({ stats: publicStats(), media, destinations, schedule });
 });
 app.get("/api/media", auth, (req, res) => {
-  const pageSize = Math.max(1, Math.min(60, Number(req.query.pageSize) || 24));
+  const pageSize = Math.max(1, Math.min(60, Number(req.query.pageSize) || 20));
+  const sort = req.query.sort === "oldest" ? "oldest" : "newest";
+  const order = sort === "oldest" ? "ASC" : "DESC";
   const total = db.prepare("SELECT COUNT(*) total FROM media").get().total;
   const pages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.max(1, Math.min(pages, Number(req.query.page) || 1));
   const items = db
     .prepare(
-      `SELECT m.*, (SELECT COUNT(*) FROM deliveries d WHERE d.media_id=m.id AND d.status='sent') sent_count FROM media m ORDER BY m.id DESC LIMIT ? OFFSET ?`,
+      `SELECT m.*, (SELECT COUNT(*) FROM deliveries d WHERE d.media_id=m.id AND d.status='sent') sent_count FROM media m ORDER BY m.id ${order} LIMIT ? OFFSET ?`,
     )
     .all(pageSize, (page - 1) * pageSize);
-  res.json({ items, page, pageSize, total, pages });
+  res.json({ items, page, pageSize, total, pages, sort });
 });
 app.post("/api/media", auth, upload.array("files", 100), (req, res) => {
   const ins = db.prepare(
@@ -360,13 +362,7 @@ app.post("/api/media/bulk-delete", auth, (req, res) => {
     return res
       .status(400)
       .json({ error: "Exclua no máximo 1.000 arquivos por vez" });
-  const ids = [
-    ...new Set(
-      requestedIds
-        .map(Number)
-        .filter(Number.isInteger),
-    ),
-  ];
+  const ids = [...new Set(requestedIds.map(Number).filter(Number.isInteger))];
   if (!ids.length)
     return res.status(400).json({ error: "Selecione pelo menos um arquivo" });
   const placeholders = ids.map(() => "?").join(",");
@@ -550,11 +546,9 @@ app.post("/api/sources", auth, async (req, res) => {
     client = await accountClient();
     const entity = await client.getEntity(peerId);
     if (entity?.noforwards)
-      return res
-        .status(400)
-        .json({
-          error: "Este canal protege o conteúdo e não pode ser importado",
-        });
+      return res.status(400).json({
+        error: "Este canal protege o conteúdo e não pode ser importado",
+      });
     let last = 0,
       done = 0;
     if (historyLimit === 0) {
@@ -1007,14 +1001,12 @@ setInterval(runSourceWorker, 60000);
 setTimeout(runSourceWorker, 5000);
 app.use((err, _req, res, _next) => {
   console.error(err);
-  res
-    .status(err.code === "LIMIT_FILE_SIZE" ? 413 : 500)
-    .json({
-      error:
-        err.code === "LIMIT_FILE_SIZE"
-          ? `Arquivo maior que ${MAX_FILE_MB} MB`
-          : err.message || "Erro interno",
-    });
+  res.status(err.code === "LIMIT_FILE_SIZE" ? 413 : 500).json({
+    error:
+      err.code === "LIMIT_FILE_SIZE"
+        ? `Arquivo maior que ${MAX_FILE_MB} MB`
+        : err.message || "Erro interno",
+  });
 });
 app.listen(Number(process.env.PORT) || 3000, "0.0.0.0", () =>
   console.log("AutoPost Telegram online"),

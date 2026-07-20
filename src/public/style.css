@@ -366,6 +366,18 @@ select:focus {
   color: var(--muted);
   font-size: 13px;
 }
+.sort-control {
+  display: flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.sort-control select {
+  width: auto;
+  padding: 8px 10px;
+}
 .selection-actions .danger {
   padding: 9px 13px;
 }
